@@ -1,3 +1,3 @@
-module.exports = require('./lib/srp');
+import srp from './lib/srp'
 
-module.exports.params = require('./lib/params');
+export default srp

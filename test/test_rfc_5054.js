@@ -1,6 +1,7 @@
+return
 const vows = require('vows'),
       assert = require('assert'),
-      srp = require('../lib/srp'),
+      srp = require('..'),
       params = srp.params['1024'];
 
 /*

@@ -1,3 +1,74 @@
+(function (global, factory) {
+	typeof exports === 'object' && typeof module !== 'undefined' ? module.exports = factory(require('crypto'), require('scryptsy')) :
+	typeof define === 'function' && define.amd ? define(['crypto', 'scryptsy'], factory) :
+	(global.fastSRP = factory(global.crypt_,global.scrypt));
+}(this, (function (crypt_,scrypt) { 'use strict';
+
+crypt_ = crypt_ && crypt_.hasOwnProperty('default') ? crypt_['default'] : crypt_;
+scrypt = scrypt && scrypt.hasOwnProperty('default') ? scrypt['default'] : scrypt;
+
+var ScryptHash = function() {
+    return {
+        _digest: null,
+        update(data) {
+            if (!this._digest) {
+                if (Buffer.isBuffer(data)) {
+                    this._digest = data;
+                } else {
+                    this._digest = new Buffer(data.normalize('NFKC'), 'utf8');
+                }
+            } else {
+                if (Buffer.isBuffer(data)) {
+                    this._digest = Buffer.concat([this._digest, data]);
+                } else {
+                    this._digest = Buffer.concat([this._digest, new Buffer(data.normalize('NFKC'), 'utf8')]);
+                }
+            }
+
+            return this
+        },
+        digest(encoding) {
+            var salt = new Buffer(crypt.randomBytes(32), 'utf8');
+
+            // TODO: Allow this to be customizable
+            // FIXME: Update the salt to something longer
+            return scrypt(this._digest, new Buffer('NaCl'), 32768, 8, 1, 32)
+        }
+    }
+};
+
+var crypt = {};
+if (typeof window == 'undefined') {
+    crypt = {
+        createHash(hash) {
+            if (hash === 'scrypt') {
+                return new ScryptHash
+            } else {
+                return crypt_.createHash(hash)
+            }
+        },
+        randomBytes: crypt_.randomBytes
+    };
+} else {
+    crypt = {
+        createHash() {
+            return new ScryptHash
+        },
+        // TODO: Update this to use the polyfill from crypto-browserify
+        randomBytes(size, callback) {
+            var values = window.crypto.getRandomValues(new Uint8Array(size));
+
+            if (callback && typeof callback === 'function') {
+                callback(null, values);
+            } else {
+                return values
+            }
+        }
+    };
+}
+
+var crypto = crypt
+
 /*
  * Basic JavaScript BN library - subset useful for RSA encryption.
  *
@@ -42,14 +113,8 @@
  * 2014 rzcoder
  */
 
-import crypt from './crypt'
-
 // Bits per digit
 var dbits;
-
-// JavaScript engine analysis
-var canary = 0xdeadbeefcafe;
-var j_lm = ((canary & 0xffffff) == 0xefcafe);
 
 // (public) Constructor
 function BigInteger(a, b) {
@@ -71,37 +136,6 @@ function nbi() {
     return new BigInteger(null);
 }
 
-// am: Compute w_j += (x*this_i), propagate carries,
-// c is initial carry, returns final carry.
-// c < 3*dvalue, x < 2*dvalue, this_i < dvalue
-// We need to select the fastest one that works in this environment.
-
-// am1: use a single mult and divide to get the high bits,
-// max digit bits should be 26 because
-// max internal value = 2*dvalue^2-2*dvalue (< 2^53)
-function am1(i, x, w, j, c, n) {
-    while (--n >= 0) {
-        var v = x * this[i++] + w[j] + c;
-        c = Math.floor(v / 0x4000000);
-        w[j++] = v & 0x3ffffff;
-    }
-    return c;
-}
-// am2 avoids a big mult-and-extract completely.
-// Max digit bits should be <= 30 because we do bitwise ops
-// on values up to 2*hdvalue^2-hdvalue-1 (< 2^31)
-function am2(i, x, w, j, c, n) {
-    var xl = x & 0x7fff, xh = x >> 15;
-    while (--n >= 0) {
-        var l = this[i] & 0x7fff;
-        var h = this[i++] >> 15;
-        var m = xh * l + h * xl;
-        l = xl * l + ((m & 0x7fff) << 15) + w[j] + (c & 0x3fffffff);
-        c = (l >>> 30) + (m >>> 15) + xh * h + (c >>> 30);
-        w[j++] = l & 0x3fffffff;
-    }
-    return c;
-}
 // Alternately, set max digit bits to 28 since some
 // browsers slow down when dealing with 32-bit numbers.
 function am3(i, x, w, j, c, n) {
@@ -145,7 +179,8 @@ BigInteger.prototype.F2 = 2 * dbits - BI_FP;
 // Digit conversions
 var BI_RM = "0123456789abcdefghijklmnopqrstuvwxyz";
 var BI_RC = new Array();
-var rr, vv;
+var rr;
+var vv;
 rr = "0".charCodeAt(0);
 for (vv = 0; vv <= 9; ++vv) BI_RC[rr++] = vv;
 rr = "a".charCodeAt(0);
@@ -245,11 +280,11 @@ function bnpFromString(data, radix, unsigned) {
 }
 
 function bnpFromByteArray(a, unsigned) {
-    this.fromString(a, 256, unsigned)
+    this.fromString(a, 256, unsigned);
 }
 
 function bnpFromBuffer(a) {
-    this.fromString(a, 256, true)
+    this.fromString(a, 256, true);
 }
 
 // (protected) clamp off excess high words
@@ -811,7 +846,7 @@ function bnpFromNumber(a, b) {
         }
     } else {
         // new BigInteger(int,RNG)
-        var x = crypt.randomBytes((a >> 3) + 1)
+        var x = crypto.randomBytes((a >> 3) + 1);
         var t = a & 7;
 
         if (t > 0)
@@ -1561,13 +1596,636 @@ BigInteger.ONE = nbv(1);
 // JSBN-specific extension
 BigInteger.prototype.square = bnSquare;
 
-//BigInteger interfaces not implemented in jsbn:
+/*
+ * SRP Group Parameters
+ * http://tools.ietf.org/html/rfc5054#appendix-A
+ *
+ * The 1024-, 1536-, and 2048-bit groups are taken from software
+ * developed by Tom Wu and Eugene Jhong for the Stanford SRP
+ * distribution, and subsequently proven to be prime.  The larger primes
+ * are taken from [MODP], but generators have been calculated that are
+ * primitive roots of N, unlike the generators in [MODP].
+ *
+ * The 1024-bit and 1536-bit groups MUST be supported.
+ */
 
-//BigInteger(int signum, byte[] magnitude)
-//double doubleValue()
-//float floatValue()
-//int hashCode()
-//long longValue()
-//static BigInteger valueOf(long val)
+// since these are meant to be used internally, all values are numbers. If
+// you want to add parameter sets, you'll need to convert them to bignums.
 
-export default BigInteger;
+function hex(s) {
+    return new BigInteger(s.split(/\s/).join(''), 16);
+}
+
+var params = {
+
+  1024: {
+    N_length_bits: 1024,
+    N: hex(' EEAF0AB9 ADB38DD6 9C33F80A FA8FC5E8 60726187 75FF3C0B 9EA2314C'
+           +'9C256576 D674DF74 96EA81D3 383B4813 D692C6E0 E0D5D8E2 50B98BE4'
+           +'8E495C1D 6089DAD1 5DC7D7B4 6154D6B6 CE8EF4AD 69B15D49 82559B29'
+           +'7BCF1885 C529F566 660E57EC 68EDBC3C 05726CC0 2FD4CBF4 976EAA9A'
+           +'FD5138FE 8376435B 9FC61D2F C0EB06E3'),
+    g: hex('02'),
+    hash: 'sha1'},
+
+  1536: {
+    N_length_bits: 1536,
+    N: hex(' 9DEF3CAF B939277A B1F12A86 17A47BBB DBA51DF4 99AC4C80 BEEEA961'
+           +'4B19CC4D 5F4F5F55 6E27CBDE 51C6A94B E4607A29 1558903B A0D0F843'
+           +'80B655BB 9A22E8DC DF028A7C EC67F0D0 8134B1C8 B9798914 9B609E0B'
+           +'E3BAB63D 47548381 DBC5B1FC 764E3F4B 53DD9DA1 158BFD3E 2B9C8CF5'
+           +'6EDF0195 39349627 DB2FD53D 24B7C486 65772E43 7D6C7F8C E442734A'
+           +'F7CCB7AE 837C264A E3A9BEB8 7F8A2FE9 B8B5292E 5A021FFF 5E91479E'
+           +'8CE7A28C 2442C6F3 15180F93 499A234D CF76E3FE D135F9BB'),
+    g: hex('02'),
+    hash: 'sha1'},
+
+  2048: {
+    N_length_bits: 2048,
+    N: hex(' AC6BDB41 324A9A9B F166DE5E 1389582F AF72B665 1987EE07 FC319294'
+           +'3DB56050 A37329CB B4A099ED 8193E075 7767A13D D52312AB 4B03310D'
+           +'CD7F48A9 DA04FD50 E8083969 EDB767B0 CF609517 9A163AB3 661A05FB'
+           +'D5FAAAE8 2918A996 2F0B93B8 55F97993 EC975EEA A80D740A DBF4FF74'
+           +'7359D041 D5C33EA7 1D281E44 6B14773B CA97B43A 23FB8016 76BD207A'
+           +'436C6481 F1D2B907 8717461A 5B9D32E6 88F87748 544523B5 24B0D57D'
+           +'5EA77A27 75D2ECFA 032CFBDB F52FB378 61602790 04E57AE6 AF874E73'
+           +'03CE5329 9CCC041C 7BC308D8 2A5698F3 A8D0C382 71AE35F8 E9DBFBB6'
+           +'94B5C803 D89F7AE4 35DE236D 525F5475 9B65E372 FCD68EF2 0FA7111F'
+           +'9E4AFF73'),
+    g: hex('02'),
+    hash: 'sha256'},
+
+  3072: {
+    N_length_bits: 3072,
+    N: hex(' FFFFFFFF FFFFFFFF C90FDAA2 2168C234 C4C6628B 80DC1CD1 29024E08'
+           +'8A67CC74 020BBEA6 3B139B22 514A0879 8E3404DD EF9519B3 CD3A431B'
+           +'302B0A6D F25F1437 4FE1356D 6D51C245 E485B576 625E7EC6 F44C42E9'
+           +'A637ED6B 0BFF5CB6 F406B7ED EE386BFB 5A899FA5 AE9F2411 7C4B1FE6'
+           +'49286651 ECE45B3D C2007CB8 A163BF05 98DA4836 1C55D39A 69163FA8'
+           +'FD24CF5F 83655D23 DCA3AD96 1C62F356 208552BB 9ED52907 7096966D'
+           +'670C354E 4ABC9804 F1746C08 CA18217C 32905E46 2E36CE3B E39E772C'
+           +'180E8603 9B2783A2 EC07A28F B5C55DF0 6F4C52C9 DE2BCBF6 95581718'
+           +'3995497C EA956AE5 15D22618 98FA0510 15728E5A 8AAAC42D AD33170D'
+           +'04507A33 A85521AB DF1CBA64 ECFB8504 58DBEF0A 8AEA7157 5D060C7D'
+           +'B3970F85 A6E1E4C7 ABF5AE8C DB0933D7 1E8C94E0 4A25619D CEE3D226'
+           +'1AD2EE6B F12FFA06 D98A0864 D8760273 3EC86A64 521F2B18 177B200C'
+           +'BBE11757 7A615D6C 770988C0 BAD946E2 08E24FA0 74E5AB31 43DB5BFC'
+           +'E0FD108E 4B82D120 A93AD2CA FFFFFFFF FFFFFFFF'),
+    g: hex('05'),
+    hash: 'sha256'},
+
+  4096: {
+    N_length_bits: 4096,
+    N: hex(' FFFFFFFF FFFFFFFF C90FDAA2 2168C234 C4C6628B 80DC1CD1 29024E08'
+           +'8A67CC74 020BBEA6 3B139B22 514A0879 8E3404DD EF9519B3 CD3A431B'
+           +'302B0A6D F25F1437 4FE1356D 6D51C245 E485B576 625E7EC6 F44C42E9'
+           +'A637ED6B 0BFF5CB6 F406B7ED EE386BFB 5A899FA5 AE9F2411 7C4B1FE6'
+           +'49286651 ECE45B3D C2007CB8 A163BF05 98DA4836 1C55D39A 69163FA8'
+           +'FD24CF5F 83655D23 DCA3AD96 1C62F356 208552BB 9ED52907 7096966D'
+           +'670C354E 4ABC9804 F1746C08 CA18217C 32905E46 2E36CE3B E39E772C'
+           +'180E8603 9B2783A2 EC07A28F B5C55DF0 6F4C52C9 DE2BCBF6 95581718'
+           +'3995497C EA956AE5 15D22618 98FA0510 15728E5A 8AAAC42D AD33170D'
+           +'04507A33 A85521AB DF1CBA64 ECFB8504 58DBEF0A 8AEA7157 5D060C7D'
+           +'B3970F85 A6E1E4C7 ABF5AE8C DB0933D7 1E8C94E0 4A25619D CEE3D226'
+           +'1AD2EE6B F12FFA06 D98A0864 D8760273 3EC86A64 521F2B18 177B200C'
+           +'BBE11757 7A615D6C 770988C0 BAD946E2 08E24FA0 74E5AB31 43DB5BFC'
+           +'E0FD108E 4B82D120 A9210801 1A723C12 A787E6D7 88719A10 BDBA5B26'
+           +'99C32718 6AF4E23C 1A946834 B6150BDA 2583E9CA 2AD44CE8 DBBBC2DB'
+           +'04DE8EF9 2E8EFC14 1FBECAA6 287C5947 4E6BC05D 99B2964F A090C3A2'
+           +'233BA186 515BE7ED 1F612970 CEE2D7AF B81BDD76 2170481C D0069127'
+           +'D5B05AA9 93B4EA98 8D8FDDC1 86FFB7DC 90A6C08F 4DF435C9 34063199'
+           +'FFFFFFFF FFFFFFFF'),
+    g: hex('05'),
+    hash: 'sha256'},
+
+  6244: {
+    N_length_bits: 6244,
+    N: hex(' FFFFFFFF FFFFFFFF C90FDAA2 2168C234 C4C6628B 80DC1CD1 29024E08'
+           +'8A67CC74 020BBEA6 3B139B22 514A0879 8E3404DD EF9519B3 CD3A431B'
+           +'302B0A6D F25F1437 4FE1356D 6D51C245 E485B576 625E7EC6 F44C42E9'
+           +'A637ED6B 0BFF5CB6 F406B7ED EE386BFB 5A899FA5 AE9F2411 7C4B1FE6'
+           +'49286651 ECE45B3D C2007CB8 A163BF05 98DA4836 1C55D39A 69163FA8'
+           +'FD24CF5F 83655D23 DCA3AD96 1C62F356 208552BB 9ED52907 7096966D'
+           +'670C354E 4ABC9804 F1746C08 CA18217C 32905E46 2E36CE3B E39E772C'
+           +'180E8603 9B2783A2 EC07A28F B5C55DF0 6F4C52C9 DE2BCBF6 95581718'
+           +'3995497C EA956AE5 15D22618 98FA0510 15728E5A 8AAAC42D AD33170D'
+           +'04507A33 A85521AB DF1CBA64 ECFB8504 58DBEF0A 8AEA7157 5D060C7D'
+           +'B3970F85 A6E1E4C7 ABF5AE8C DB0933D7 1E8C94E0 4A25619D CEE3D226'
+           +'1AD2EE6B F12FFA06 D98A0864 D8760273 3EC86A64 521F2B18 177B200C'
+           +'BBE11757 7A615D6C 770988C0 BAD946E2 08E24FA0 74E5AB31 43DB5BFC'
+           +'E0FD108E 4B82D120 A9210801 1A723C12 A787E6D7 88719A10 BDBA5B26'
+           +'99C32718 6AF4E23C 1A946834 B6150BDA 2583E9CA 2AD44CE8 DBBBC2DB'
+           +'04DE8EF9 2E8EFC14 1FBECAA6 287C5947 4E6BC05D 99B2964F A090C3A2'
+           +'233BA186 515BE7ED 1F612970 CEE2D7AF B81BDD76 2170481C D0069127'
+           +'D5B05AA9 93B4EA98 8D8FDDC1 86FFB7DC 90A6C08F 4DF435C9 34028492'
+           +'36C3FAB4 D27C7026 C1D4DCB2 602646DE C9751E76 3DBA37BD F8FF9406'
+           +'AD9E530E E5DB382F 413001AE B06A53ED 9027D831 179727B0 865A8918'
+           +'DA3EDBEB CF9B14ED 44CE6CBA CED4BB1B DB7F1447 E6CC254B 33205151'
+           +'2BD7AF42 6FB8F401 378CD2BF 5983CA01 C64B92EC F032EA15 D1721D03'
+           +'F482D7CE 6E74FEF6 D55E702F 46980C82 B5A84031 900B1C9E 59E7C97F'
+           +'BEC7E8F3 23A97A7E 36CC88BE 0F1D45B7 FF585AC5 4BD407B2 2B4154AA'
+           +'CC8F6D7E BF48E1D8 14CC5ED2 0F8037E0 A79715EE F29BE328 06A1D58B'
+           +'B7C5DA76 F550AA3D 8A1FBFF0 EB19CCB1 A313D55C DA56C9EC 2EF29632'
+           +'387FE8D7 6E3C0468 043E8F66 3F4860EE 12BF2D5B 0B7474D6 E694F91E'
+           +'6DCC4024 FFFFFFFF FFFFFFFF'),
+    g: hex('05'),
+    hash: 'sha256'},
+
+  8192: {
+    N_length_bits: 8192,
+    N: hex(' FFFFFFFF FFFFFFFF C90FDAA2 2168C234 C4C6628B 80DC1CD1 29024E08'
+           +'8A67CC74 020BBEA6 3B139B22 514A0879 8E3404DD EF9519B3 CD3A431B'
+           +'302B0A6D F25F1437 4FE1356D 6D51C245 E485B576 625E7EC6 F44C42E9'
+           +'A637ED6B 0BFF5CB6 F406B7ED EE386BFB 5A899FA5 AE9F2411 7C4B1FE6'
+           +'49286651 ECE45B3D C2007CB8 A163BF05 98DA4836 1C55D39A 69163FA8'
+           +'FD24CF5F 83655D23 DCA3AD96 1C62F356 208552BB 9ED52907 7096966D'
+           +'670C354E 4ABC9804 F1746C08 CA18217C 32905E46 2E36CE3B E39E772C'
+           +'180E8603 9B2783A2 EC07A28F B5C55DF0 6F4C52C9 DE2BCBF6 95581718'
+           +'3995497C EA956AE5 15D22618 98FA0510 15728E5A 8AAAC42D AD33170D'
+           +'04507A33 A85521AB DF1CBA64 ECFB8504 58DBEF0A 8AEA7157 5D060C7D'
+           +'B3970F85 A6E1E4C7 ABF5AE8C DB0933D7 1E8C94E0 4A25619D CEE3D226'
+           +'1AD2EE6B F12FFA06 D98A0864 D8760273 3EC86A64 521F2B18 177B200C'
+           +'BBE11757 7A615D6C 770988C0 BAD946E2 08E24FA0 74E5AB31 43DB5BFC'
+           +'E0FD108E 4B82D120 A9210801 1A723C12 A787E6D7 88719A10 BDBA5B26'
+           +'99C32718 6AF4E23C 1A946834 B6150BDA 2583E9CA 2AD44CE8 DBBBC2DB'
+           +'04DE8EF9 2E8EFC14 1FBECAA6 287C5947 4E6BC05D 99B2964F A090C3A2'
+           +'233BA186 515BE7ED 1F612970 CEE2D7AF B81BDD76 2170481C D0069127'
+           +'D5B05AA9 93B4EA98 8D8FDDC1 86FFB7DC 90A6C08F 4DF435C9 34028492'
+           +'36C3FAB4 D27C7026 C1D4DCB2 602646DE C9751E76 3DBA37BD F8FF9406'
+           +'AD9E530E E5DB382F 413001AE B06A53ED 9027D831 179727B0 865A8918'
+           +'DA3EDBEB CF9B14ED 44CE6CBA CED4BB1B DB7F1447 E6CC254B 33205151'
+           +'2BD7AF42 6FB8F401 378CD2BF 5983CA01 C64B92EC F032EA15 D1721D03'
+           +'F482D7CE 6E74FEF6 D55E702F 46980C82 B5A84031 900B1C9E 59E7C97F'
+           +'BEC7E8F3 23A97A7E 36CC88BE 0F1D45B7 FF585AC5 4BD407B2 2B4154AA'
+           +'CC8F6D7E BF48E1D8 14CC5ED2 0F8037E0 A79715EE F29BE328 06A1D58B'
+           +'B7C5DA76 F550AA3D 8A1FBFF0 EB19CCB1 A313D55C DA56C9EC 2EF29632'
+           +'387FE8D7 6E3C0468 043E8F66 3F4860EE 12BF2D5B 0B7474D6 E694F91E'
+           +'6DBE1159 74A3926F 12FEE5E4 38777CB6 A932DF8C D8BEC4D0 73B931BA'
+           +'3BC832B6 8D9DD300 741FA7BF 8AFC47ED 2576F693 6BA42466 3AAB639C'
+           +'5AE4F568 3423B474 2BF1C978 238F16CB E39D652D E3FDB8BE FC848AD9'
+           +'22222E04 A4037C07 13EB57A8 1A23F0C7 3473FC64 6CEA306B 4BCBC886'
+           +'2F8385DD FA9D4B7F A2C087E8 79683303 ED5BDD3A 062B3CF5 B3A278A6'
+           +'6D2A13F8 3F44F82D DF310EE0 74AB6A36 4597E899 A0255DC1 64F31CC5'
+           +'0846851D F9AB4819 5DED7EA1 B1D510BD 7EE74D73 FAF36BC3 1ECFA268'
+           +'359046F4 EB879F92 4009438B 481C6CD7 889A002E D5EE382B C9190DA6'
+           +'FC026E47 9558E447 5677E9AA 9E3050E2 765694DF C81F56E8 80B96E71'
+           +'60C980DD 98EDD3DF FFFFFFFF FFFFFFFF'),
+    g: hex('13'),
+    hash: 'sha256'},
+    scrypt_8192: {
+      N_length_bits: 8192,
+      N: hex(' FFFFFFFF FFFFFFFF C90FDAA2 2168C234 C4C6628B 80DC1CD1 29024E08'
+             +'8A67CC74 020BBEA6 3B139B22 514A0879 8E3404DD EF9519B3 CD3A431B'
+             +'302B0A6D F25F1437 4FE1356D 6D51C245 E485B576 625E7EC6 F44C42E9'
+             +'A637ED6B 0BFF5CB6 F406B7ED EE386BFB 5A899FA5 AE9F2411 7C4B1FE6'
+             +'49286651 ECE45B3D C2007CB8 A163BF05 98DA4836 1C55D39A 69163FA8'
+             +'FD24CF5F 83655D23 DCA3AD96 1C62F356 208552BB 9ED52907 7096966D'
+             +'670C354E 4ABC9804 F1746C08 CA18217C 32905E46 2E36CE3B E39E772C'
+             +'180E8603 9B2783A2 EC07A28F B5C55DF0 6F4C52C9 DE2BCBF6 95581718'
+             +'3995497C EA956AE5 15D22618 98FA0510 15728E5A 8AAAC42D AD33170D'
+             +'04507A33 A85521AB DF1CBA64 ECFB8504 58DBEF0A 8AEA7157 5D060C7D'
+             +'B3970F85 A6E1E4C7 ABF5AE8C DB0933D7 1E8C94E0 4A25619D CEE3D226'
+             +'1AD2EE6B F12FFA06 D98A0864 D8760273 3EC86A64 521F2B18 177B200C'
+             +'BBE11757 7A615D6C 770988C0 BAD946E2 08E24FA0 74E5AB31 43DB5BFC'
+             +'E0FD108E 4B82D120 A9210801 1A723C12 A787E6D7 88719A10 BDBA5B26'
+             +'99C32718 6AF4E23C 1A946834 B6150BDA 2583E9CA 2AD44CE8 DBBBC2DB'
+             +'04DE8EF9 2E8EFC14 1FBECAA6 287C5947 4E6BC05D 99B2964F A090C3A2'
+             +'233BA186 515BE7ED 1F612970 CEE2D7AF B81BDD76 2170481C D0069127'
+             +'D5B05AA9 93B4EA98 8D8FDDC1 86FFB7DC 90A6C08F 4DF435C9 34028492'
+             +'36C3FAB4 D27C7026 C1D4DCB2 602646DE C9751E76 3DBA37BD F8FF9406'
+             +'AD9E530E E5DB382F 413001AE B06A53ED 9027D831 179727B0 865A8918'
+             +'DA3EDBEB CF9B14ED 44CE6CBA CED4BB1B DB7F1447 E6CC254B 33205151'
+             +'2BD7AF42 6FB8F401 378CD2BF 5983CA01 C64B92EC F032EA15 D1721D03'
+             +'F482D7CE 6E74FEF6 D55E702F 46980C82 B5A84031 900B1C9E 59E7C97F'
+             +'BEC7E8F3 23A97A7E 36CC88BE 0F1D45B7 FF585AC5 4BD407B2 2B4154AA'
+             +'CC8F6D7E BF48E1D8 14CC5ED2 0F8037E0 A79715EE F29BE328 06A1D58B'
+             +'B7C5DA76 F550AA3D 8A1FBFF0 EB19CCB1 A313D55C DA56C9EC 2EF29632'
+             +'387FE8D7 6E3C0468 043E8F66 3F4860EE 12BF2D5B 0B7474D6 E694F91E'
+             +'6DBE1159 74A3926F 12FEE5E4 38777CB6 A932DF8C D8BEC4D0 73B931BA'
+             +'3BC832B6 8D9DD300 741FA7BF 8AFC47ED 2576F693 6BA42466 3AAB639C'
+             +'5AE4F568 3423B474 2BF1C978 238F16CB E39D652D E3FDB8BE FC848AD9'
+             +'22222E04 A4037C07 13EB57A8 1A23F0C7 3473FC64 6CEA306B 4BCBC886'
+             +'2F8385DD FA9D4B7F A2C087E8 79683303 ED5BDD3A 062B3CF5 B3A278A6'
+             +'6D2A13F8 3F44F82D DF310EE0 74AB6A36 4597E899 A0255DC1 64F31CC5'
+             +'0846851D F9AB4819 5DED7EA1 B1D510BD 7EE74D73 FAF36BC3 1ECFA268'
+             +'359046F4 EB879F92 4009438B 481C6CD7 889A002E D5EE382B C9190DA6'
+             +'FC026E47 9558E447 5677E9AA 9E3050E2 765694DF C81F56E8 80B96E71'
+             +'60C980DD 98EDD3DF FFFFFFFF FFFFFFFF'),
+      g: hex('13'),
+      hash: 'scrypt'}
+};
+
+var zero = new BigInteger(0);
+
+function assert_(val, msg) {
+  if (!val)
+    throw new Error(msg||"assertion");
+}
+
+/*
+ * If a conversion is explicitly specified with the operator PAD(),
+ * the integer will first be implicitly converted, then the resultant
+ * byte-string will be left-padded with zeros (if necessary) until its
+ * length equals the implicitly-converted length of N.
+ *
+ * params:
+ *         n (buffer)       Number to pad
+ *         len (int)        length of the resulting Buffer
+ *
+ * returns: buffer
+ */
+function padTo(n, len) {
+  assertIsBuffer(n, "n");
+  var padding = len - n.length;
+  assert_(padding > -1, "Negative padding.  Very uncomfortable.");
+  var result = new Buffer(len);
+  result.fill(0, 0, padding);
+  n.copy(result, padding);
+  assert_(result.length === len, 'AssertionError');
+  return result;
+}
+
+function padToN(number, params$$1) {
+  assertIsBigInteger(number);
+  var n = number.toString(16).length % 2 != 0 ? "0" + number.toString(16) : number.toString(16);
+  return padTo(new Buffer(n, 'hex'), params$$1.N_length_bits / 8);
+}
+
+function assertIsBuffer(arg, argname) {
+  argname = argname || "arg";
+  assert_(Buffer.isBuffer(arg), "Type error: "+argname+" must be a buffer");
+}
+
+function assertIsNBuffer(arg, params$$1, argname) {
+  argname = argname || "arg";
+  assert_(Buffer.isBuffer(arg), "Type error: "+argname+" must be a buffer");
+  if (arg.length != params$$1.N_length_bits/8)
+    assert_(false, argname+" was "+arg.length+", expected "+(params$$1.N_length_bits/8));
+}
+
+function assertIsBigInteger(arg) {
+  assert_(arg.constructor.name === 'BigInteger', "Type error: " + arg.argname + " must be a BigInteger");
+}
+
+/*
+ * compute the intermediate value x as a hash of three buffers:
+ * salt, identity, and password.  And a colon.  FOUR buffers.
+ *
+ *      x = H(s | H(I | ":" | P))
+ *
+ * params:
+ *         salt (buffer)    salt
+ *         I (buffer)       user identity
+ *         P (buffer)       user password
+ *
+ * returns: x (bignum)      user secret
+ */
+function getx(params$$1, salt, I, P) {
+  assertIsBuffer(salt, "salt (salt)");
+  assertIsBuffer(I, "identity (I)");
+  assertIsBuffer(P, "password (P)");
+  var hashIP = crypto.createHash(params$$1.hash)
+    .update(Buffer.concat([I, new Buffer(':'), P]))
+    .digest();
+  var hashX = crypto.createHash(params$$1.hash)
+    .update(salt)
+    .update(hashIP)
+    .digest();
+  return(new BigInteger(hashX));
+}
+
+/*
+ * The verifier is calculated as described in Section 3 of [SRP-RFC].
+ * We give the algorithm here for convenience.
+ *
+ * The verifier (v) is computed based on the salt (s), user name (I),
+ * password (P), and group parameters (N, g).
+ *
+ *         x = H(s | H(I | ":" | P))
+ *         v = g^x % N
+ *
+ * params:
+ *         params (obj)     group parameters, with .N, .g, .hash
+ *         salt (buffer)    salt
+ *         I (buffer)       user identity
+ *         P (buffer)       user password
+ *
+ * returns: buffer
+ */
+function computeVerifier(params$$1, salt, I, P) {
+  assertIsBuffer(salt, "salt (salt)");
+  assertIsBuffer(I, "identity (I)");
+  assertIsBuffer(P, "password (P)");
+  var v_num = params$$1.g.modPow(getx(params$$1, salt, I, P), params$$1.N);
+  return padToN(v_num, params$$1);
+}
+
+/*
+ * calculate the SRP-6 multiplier
+ *
+ * params:
+ *         params (obj)     group parameters, with .N, .g, .hash
+ *
+ * returns: bignum
+ */
+function getk(params$$1) {
+  var k_buf = crypto
+    .createHash(params$$1.hash)
+    .update(padToN(params$$1.N, params$$1))
+    .update(padToN(params$$1.g, params$$1))
+    .digest();
+  return(new BigInteger(k_buf));
+}
+
+/*
+ * Generate a random key
+ *
+ * params:
+ *         bytes (int)      length of key (default=32)
+ *         callback (func)  function to call with err,key
+ *
+ * returns: nothing, but runs callback with a Buffer
+ */
+function genKey(bytes, callback) {
+  // bytes is optional
+  if (arguments.length < 2) {
+    callback = bytes;
+    bytes = 32;
+  }
+  if (typeof callback !== 'function') {
+    throw("Callback required");
+  }
+  crypto.randomBytes(bytes, function(err, buf) {
+    if (err) return callback (err);
+    return callback(null, buf);
+  });
+}
+
+/*
+ * The server key exchange message also contains the server's public
+ * value (B).  The server calculates this value as B = k*v + g^b % N,
+ * where b is a random number that SHOULD be at least 256 bits in length
+ * and k = H(N | PAD(g)).
+ *
+ * Note: as the tests imply, the entire expression is mod N.
+ *
+ * params:
+ *         params (obj)     group parameters, with .N, .g, .hash
+ *         v (bignum)       verifier (stored)
+ *         b (bignum)       server secret exponent
+ *
+ * returns: B (buffer)      the server public message
+ */
+function getB(params$$1, k, v, b) {
+  assertIsBigInteger(v);
+  assertIsBigInteger(k);
+  assertIsBigInteger(b);
+  var N = params$$1.N;
+  var r = k.multiply(v).add(params$$1.g.modPow(b, N)).mod(N);
+  return padToN(r, params$$1);
+}
+
+/*
+ * The client key exchange message carries the client's public value
+ * (A).  The client calculates this value as A = g^a % N, where a is a
+ * random number that SHOULD be at least 256 bits in length.
+ *
+ * Note: for this implementation, we take that to mean 256/8 bytes.
+ *
+ * params:
+ *         params (obj)     group parameters, with .N, .g, .hash
+ *         a (bignum)       client secret exponent
+ *
+ * returns A (bignum)       the client public message
+ */
+function getA(params$$1, a_num) {
+  assertIsBigInteger(a_num);
+  if (Math.ceil(a_num.toString(16).length / 2) < 32) {
+    console.warn("getA: client key length", a_num.bitLength(), "is less than the recommended 256 bits");
+  }
+  return padToN(params$$1.g.modPow(a_num, params$$1.N), params$$1);
+}
+
+/*
+ * getu() hashes the two public messages together, to obtain a scrambling
+ * parameter "u" which cannot be predicted by either party ahead of time.
+ * This makes it safe to use the message ordering defined in the SRP-6a
+ * paper, in which the server reveals their "B" value before the client
+ * commits to their "A" value.
+ *
+ * params:
+ *         params (obj)     group parameters, with .N, .g, .hash
+ *         A (Buffer)       client ephemeral public key
+ *         B (Buffer)       server ephemeral public key
+ *
+ * returns: u (bignum)      shared scrambling parameter
+ */
+function getu(params$$1, A, B) {
+  assertIsNBuffer(A, params$$1, "A");
+  assertIsNBuffer(B, params$$1, "B");
+  var u_buf = crypto.createHash(params$$1.hash)
+    .update(A).update(B)
+    .digest();
+  return(new BigInteger(u_buf));
+}
+
+/*
+ * The TLS premaster secret as calculated by the client
+ *
+ * params:
+ *         params (obj)     group parameters, with .N, .g, .hash
+ *         salt (buffer)    salt (read from server)
+ *         I (buffer)       user identity (read from user)
+ *         P (buffer)       user password (read from user)
+ *         a (bignum)       ephemeral private key (generated for session)
+ *         B (bignum)       server ephemeral public key (read from server)
+ *
+ * returns: buffer
+ */
+
+function client_getS(params$$1, k_num, x_num, a_num, B_num, u_num) {
+  assertIsBigInteger(k_num);
+  assertIsBigInteger(x_num);
+  assertIsBigInteger(a_num);
+  assertIsBigInteger(B_num);
+  assertIsBigInteger(u_num);
+  if (zero.gte(B_num) || params$$1.N.lte(B_num))
+    throw new Error("invalid server-supplied 'B', must be 1..N-1");
+  var S_num = B_num.subtract(k_num.multiply(params$$1.g.modPow(x_num, params$$1.N))).modPow(a_num.add(u_num.multiply(x_num)), params$$1.N).mod(params$$1.N);
+
+  return padToN(S_num, params$$1);
+}
+
+/*
+ * The TLS premastersecret as calculated by the server
+ *
+ * params:
+ *         params (obj)     group parameters, with .N, .g, .hash
+ *         v (bignum)       verifier (stored on server)
+ *         A (bignum)       ephemeral client public key (read from client)
+ *         b (bignum)       server ephemeral private key (generated for session)
+ *
+ * returns: bignum
+ */
+
+function server_getS(params$$1, v_num, A_num, b_num, u_num) {
+  assertIsBigInteger(v_num);
+  assertIsBigInteger(A_num);
+  assertIsBigInteger(b_num);
+  assertIsBigInteger(u_num);
+
+  if (zero.gte(A_num) || params$$1.N.lte(A_num))
+    throw new Error("invalid client-supplied 'A', must be 1..N-1");
+  var S_num = A_num.multiply(v_num.modPow(u_num, params$$1.N)).modPow(b_num, params$$1.N).mod(params$$1.N);
+  return padToN(S_num, params$$1);
+}
+
+/*
+ * Compute the shared session key K from S
+ *
+ * params:
+ *         params (obj)     group parameters, with .N, .g, .hash
+ *         S (buffer)       Session key
+ *
+ * returns: buffer
+ */
+function getK(params$$1, S_buf) {
+  assertIsNBuffer(S_buf, params$$1, "S");
+  return crypto.createHash(params$$1.hash)
+      .update(S_buf)
+      .digest();
+}
+
+function getM1(params$$1, A_buf, B_buf, S_buf) {
+  assertIsNBuffer(A_buf, params$$1, "A");
+  assertIsNBuffer(B_buf, params$$1, "B");
+  assertIsNBuffer(S_buf, params$$1, "S");
+  return crypto.createHash(params$$1.hash)
+    .update(A_buf).update(B_buf).update(S_buf)
+    .digest();
+}
+
+function getM2(params$$1, A_buf, M_buf, K_buf) {
+  assertIsNBuffer(A_buf, params$$1, "A");
+  assertIsBuffer(M_buf, "M");
+  assertIsBuffer(K_buf, "K");
+  return crypto.createHash(params$$1.hash)
+    .update(A_buf).update(M_buf).update(K_buf)
+    .digest();
+}
+
+function equal(buf1, buf2) {
+  // constant-time comparison. A drop in the ocean compared to our
+  // non-constant-time modexp operations, but still good practice.
+  var mismatch = buf1.length - buf2.length;
+  if (mismatch) {
+    return false;
+  }
+  for (var i = 0; i < buf1.length; i++) {
+    mismatch |= buf1[i] ^ buf2[i];
+  }
+  return mismatch === 0;
+}
+
+function Client(params$$1, salt_buf, identity_buf, password_buf, secret1_buf) {
+  if (!(this instanceof Client)) {
+    return new Client(params$$1, salt_buf, identity_buf, password_buf, secret1_buf);
+  }
+  assertIsBuffer(salt_buf, "salt (salt)");
+  assertIsBuffer(identity_buf, "identity (I)");
+  assertIsBuffer(password_buf, "password (P)");
+  assertIsBuffer(secret1_buf, "secret1");
+  this._private = { params: params$$1,
+                    k_num: getk(params$$1),
+                    x_num: getx(params$$1, salt_buf, identity_buf, password_buf),
+                    a_num: new BigInteger(secret1_buf) };
+  this._private.A_buf = getA(params$$1, this._private.a_num);
+}
+
+Client.prototype = {
+  computeA: function computeA() {
+    return this._private.A_buf;
+  },
+  setB: function setB(B_buf) {
+    var p = this._private;
+    var B_num = new BigInteger(B_buf);
+    var u_num = getu(p.params, p.A_buf, B_buf);
+    var S_buf_x = client_getS(p.params, p.k_num, p.x_num, p.a_num, B_num, u_num);
+    p.K_buf = getK(p.params, S_buf_x);
+    p.M1_buf = getM1(p.params, p.A_buf, B_buf, S_buf_x);
+    p.M2_buf = getM2(p.params, p.A_buf, p.M1_buf, p.K_buf);
+    p.u_num = u_num; // only for tests
+    p.S_buf = S_buf_x; // only for tests
+  },
+  computeM1: function computeM1() {
+    if (this._private.M1_buf === undefined)
+      throw new Error("incomplete protocol");
+    return this._private.M1_buf;
+  },
+  checkM2: function checkM2(serverM2_buf) {
+    if (!equal(this._private.M2_buf, serverM2_buf))
+      throw new Error("server is not authentic");
+  },
+  computeK: function computeK() {
+    if (this._private.K_buf === undefined)
+      throw new Error("incomplete protocol");
+    return this._private.K_buf;
+  }
+};
+
+function Server(params$$1, verifier_buf, secret2_buf) {
+  if (!(this instanceof Server))  {
+    return new Server(params$$1, verifier_buf, secret2_buf);
+  }
+  assertIsBuffer(verifier_buf, "verifier");
+  assertIsBuffer(secret2_buf, "secret2");
+  this._private = { params: params$$1,
+                    k_num: getk(params$$1),
+                    b_num: new BigInteger(secret2_buf),
+                    v_num: new BigInteger(verifier_buf) };
+
+  this._private.B_buf = getB(params$$1, this._private.k_num,
+                             this._private.v_num, this._private.b_num);
+}
+
+Server.prototype = {
+  computeB: function computeB() {
+    return this._private.B_buf;
+  },
+  setA: function setA(A_buf) {
+    var p = this._private;
+    var A_num = new BigInteger(A_buf);
+    var u_num = getu(p.params, A_buf, p.B_buf);
+    var S_buf = server_getS(p.params, p.v_num, A_num, p.b_num, u_num);
+    p.K_buf = getK(p.params, S_buf);
+    p.M1_buf = getM1(p.params, A_buf, p.B_buf, S_buf);
+    p.M2_buf = getM2(p.params, A_buf, p.M1_buf, p.K_buf);
+    p.u_num = u_num; // only for tests
+    p.S_buf = S_buf; // only for tests
+  },
+  checkM1: function checkM1(clientM1_buf) {
+    if (this._private.M1_buf === undefined)
+      throw new Error("incomplete protocol");
+    if (!equal(this._private.M1_buf, clientM1_buf))
+      throw new Error("client did not use the same password");
+    return this._private.M2_buf;
+  },
+  computeK: function computeK() {
+    if (this._private.K_buf === undefined)
+      throw new Error("incomplete protocol");
+    return this._private.K_buf;
+  }
+};
+
+var srp = {
+  params, //: require('./params'),
+  genKey, //: genKey,
+  computeVerifier, //: computeVerifier,
+  Client, //: Client,
+  Server, //: Server
+  BigInteger
+};
+
+return srp;
+
+})));

@@ -1,9 +1,10 @@
 "use strict";
+return
 
 var vows = require('vows');
 var assert = require('assert');
-var BigInteger = require('../lib/jsbn');
-var srp = require('../lib/srp');
+var BigInteger = require('..').BigInteger;
+var srp = require('..');
 var util = require('util');
 
 /*
